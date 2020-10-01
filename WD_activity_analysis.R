@@ -1,17 +1,31 @@
-## Calculating activity, overlap, and difference in daily activity patterns ## 
+#############################################
+## Calculating circadian activity patterns ## 
+#############################################
 
-# load functions and libraries 
+# Analysis of Gorongosa Park camera trap data looking to see whether wild dog 
+# release affected the daily activity patterns of ungulate species across 
+# different areas of wild dog use
+
+# M.S.Palmer 29 Sep 2020
+
+# set workspace 
+rm(list=ls())
+setwd("~/Desktop/Grad School/Post doc_Princeton/Mozambique/Data_Kaitlyn/Camera Trap Data/Processed camera data")
+
+# load libraries 
 library(overlap); library(sp); library(dplyr); library(lubridate); library(sf); library(activity)
-library(pryr); library(ggplot2); library(Hmisc); library(tidyverse); library(Rmisc); library(glmmTMB)
-library(MuMIn); library(stringr); library(DHARMa)
-
-source("WildDog_Activity_Level_Functions.R")
+library(pryr); library(ggplot2); library(Hmisc); library(tidyverse); library(Rmisc); library(mgcv)
+library(MuMIn); library(stringr); library(DHARMa); library(plyr); library(errors); library(glmmTMB)
+library(MASS)
+#library(mgcViz) <-- cannot get this package to load, but think would have cool plotting features if worked
 
 # load data
 dat <- read.csv("WildCamData_WildDog_Formatted.csv") 
+names(dat)[c(12, 15:19, 27, 29, 30)] <- c("Season", "Height.cm", "Angle", "Detect.Obsc", "Ground.Cov", "Term.Count", "Road.Dist", "Tree.Density.1km", "Urema.Dist")
+dat <- dat[c("Camera", "Species", "DateTime", "Season", "Tree.Density.1km", "Road.Dist", "Urema.Dist", "Height.cm", "Angle", "Detect.Obsc", "Ground.Cov", "Term.Count")]
 
 # select species
-species.list <- c("Bushbuck", "Reedbuck", "Nyala", "Oribi", "Impala", "Waterbuck", "Warthog", "Kudu", "Buffalo", "Bushpig", "Elephant", "Wildebeest", "Duiker", "Hartebeest")
+species.list <- c("Bushbuck", "Reedbuck", "Nyala", "Oribi", "Impala", "Waterbuck", "Warthog", "Kudu", "Buffalo", "Bushpig", "Elephant", "Wildebeest", "Duiker", "Hartebeest", "Eland")
 
 # info for formatting data-time 
 tz.ct <- "Africa/Maputo"
@@ -28,283 +42,306 @@ no.use <- c("E02", "E12", "F01", "G02", "G12", "H03", "H11", "H13", "I04", "I06"
 
 # format date-time, sunrise/sunset, pre-/post-release designation 
 dat <- dat %>% 
-  mutate(DateTime = as.POSIXct(DateTime, "%Y-%m-%d %H:%M:%S", tz=tz.ct), 
-         Date = as.POSIXct(dat$DateTime, format = "%Y-%m-%d", tz = tz.ct), 
+  mutate(DateTime = as.POSIXct(DateTime, "%m/%d/%y %H:%M", tz=tz.ct), 
          Time.Decimal = hour(DateTime) + minute(DateTime)/60 + second(DateTime)/3600, 
          Time.Radians = (Time.Decimal / 24) * 2 * pi, 
-         Time.Sun = sunTime(Time.Radians, Date, coords), 
+         Time.Sun = sunTime(Time.Radians, DateTime, coords), 
          Sun.Hour = (Time.Sun * 24) / (2 * pi),
          Sun.Hour = floor(Sun.Hour),
          Year = year(DateTime),
-         TimePeriod = ifelse(DateTime < wd.release, "PreRelease", "PostRelease"), 
-         WildDogUse = ifelse(Camera %in% high.use, "high.use", ifelse(Camera %in% low.use, "low.use", "no.use")), 
+         TimePeriod = factor(ifelse(DateTime < wd.release, "PreRelease", "PostRelease")), 
+         WildDogUse = factor(ifelse(Camera %in% high.use, "high.use", 
+                                    ifelse(Camera %in% low.use,"low.use", "no.use"))), 
          Season.Year = paste(Season, Year), 
          s.Tree.Density.1km = scale(Tree.Density.1km), 
          s.Urema.Dist = scale(Urema.Dist), 
-         s.Road.Dist = scale(Road.Dist)) %>%
+         s.Road.Dist = scale(Road.Dist), 
+         s.Termite = scale(Term.Count),
+         s.Height = scale(Height.cm),
+         s.Angle = scale(Angle),
+         Detect.Obsc = factor(Detect.Obsc),
+         s.Ground.Cov = scale(Ground.Cov)) %>%
   filter(Species %in% species.list)
+dat$Date <- gsub( " .*$", "", dat$DateTime) #doesn't run in pipe for some reason
+dat$Sun.Hour <- floor(dat$Sun.Hour) #doesn't run in pipe for some reason
+
+# re-order levels
+dat$TimePeriod <- factor(dat$TimePeriod, levels = c("PreRelease", "PostRelease"))
+dat$WildDogUse <- factor(dat$WildDogUse, levels = c("no.use", "low.use", "high.use"))
 
 # as wet season runs Dec-Mar, add Dec to "next years'" wet season 
-dat$Season.Year <- ifelse((dat$Season == "Wet" & month(dat$DateTime) == 12), paste("Wet", (year(dat$DateTime)+1)), dat$Season.Year)
+dat$Season.Year <- ifelse((dat$Season == "Wet" & month(dat$DateTime) == 12), 
+                          paste("Wet", (year(dat$DateTime)+1)), dat$Season.Year)
 
 # disgard 2018 early dry (transition period), 2016 early dry (incomplete season) 
 dat <- dat[!(dat$Season == "Early Dry" & year(dat$DateTime) %in% c("2016", "2018")),] 
 
 
-## modelling ------------------
 
-## 1) activity ----------------
+### analyses ------------------
 
-# does overall activity level change depending on time period x wild dog use area + spatial and temporal environmental covariates? 
+## 1) calculating circadian activity distributions and evaluating whether daily patterns 
+## of activity change after wild dog release 
 
-# for iterating through species, save model rankings and model output here:
-final.sel.table <- NULL
-final.mod.table <- NULL
+# this function requires that both before and after data include at least 10 observations 
+act.diel.difs <- function(dat, species, wild.dog.use, nboots){
+    
+    # calculate activity 
+    before <- dat[(dat$Species == species & dat$WildDogUse == wild.dog.use & dat$TimePeriod == "PreRelease"),]
+    after <- dat[(dat$Species == species & dat$WildDogUse == wild.dog.use & dat$TimePeriod == "PostRelease"),]
+    
+    if(nrow(before) & nrow(after) >= 10){
+      wts.before <- 1/ifelse(before$Time.Sun>pi/2 & before$Time.Sun<pi*3/2, 1.5, 1)
+      wts.after <- 1/ifelse(after$Time.Sun>pi/2 & after$Time.Sun<pi*3/2, 1.5, 1)
+      
+      before.fit <- fitact(before$Time.Sun, sample="model", reps=nboots, wt=wts.before)
+      after.fit <- fitact(after$Time.Sun, sample="model", reps=nboots, wt=wts.after)
+      
+      # differences in diel patterning before and after 
+      diel.dif <- as.data.frame(t(compareCkern(before.fit, after.fit, reps=nboots)))
+      diel.dif$Species <- as.character(species)
+      diel.dif$WildDogUse <- wild.dog.use
+      diel.dif <- diel.dif[c(5:6,1:4)]
+      names(diel.dif)[3:6] <- c("Obs. Overlap Index", "Null Mean Overlap Index", "SE Null", 
+                                "Prob Obs. Index Chance")
+      diel.dif[,c(3:6)] <- round(diel.dif[,c(3:6)], 3)
+      diel.dif[c(1:6)] <- sapply(diel.dif[c(1:6)], as.character)
+      
+    } else {
+      diel.dif <- data.frame(Species = as.character(species), WildDogUse = as.character(wild.dog.use), 
+                             `Obs. Overlap Index` = "Not Enough Data", `Null Mean Overlap Index` = "NA",
+                             `SE Null`= 'NA', `Prob Obs. Index Chance` = "NA")
+      names(diel.dif)[c(3:6)] <- c("Obs. Overlap Index", "Null Mean Overlap Index", "SE Null",
+                                   "Prob Obs. Index Chance")
+    }
+    return(diel.dif) 
+}
 
-# iterate through species (manually, so can check models/residuals) 
-# species: Impala, Kudu, Warthog, Waterbuck, Oribi, Reedbuck, Buffalo, Bushbuck, Bushpig, Elephant, Nyala, Duiker, Hartebeest, Eland, Wildebeest
-
-species <- "Warthog"
-act.data <- dat[dat$Species == species,]
-
-m1 <- glmmTMB(Time.Sun ~ TimePeriod + WildDogUse + Season + (1|Camera), data = act.data)
-m2 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + (1|Camera), data = act.data) 
-m3 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season +  s.Tree.Density.1km + (1|Camera), data = act.data)
-m4 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Road.Dist + (1|Camera), data = act.data) 
-m5 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Urema.Dist + (1|Camera), data = act.data) 
-m6 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Tree.Density.1km + s.Urema.Dist + (1|Camera), data = act.data)
-m7 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Tree.Density.1km + s.Road.Dist + (1|Camera), data = act.data) 
-m8 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Urema.Dist + s.Road.Dist + (1|Camera), data = act.data)
-m9 <- glmmTMB(Time.Sun ~ TimePeriod*WildDogUse + Season + s.Tree.Density.1km + s.Road.Dist + s.Urema.Dist + (1|Camera), data = act.data)
-
-# model ranking
-(mod.list <- model.sel(m1, m2, m3, m4, m5, m6, m7, m8, m9))
-
-# evaluate model residuals (fill in best-fit model)
-acf(resid(m5)); pacf(resid(m5))
-simres <- simulateResiduals(m5); plot(simres)
-
-# coerce model rankings into neat dataframe and save
-sel.table <- as.data.frame(mod.list)[(length(mod.list)-4):length(mod.list)] 
-sel.table[,2:3] <- round(sel.table[,2:3],2)
-sel.table[,4:5] <- round(sel.table[,4:5],3)
-sel.table$Model <- rownames(sel.table)
-for(i in 1:nrow(sel.table)) sel.table$Model[i]<- as.character(formula(paste(sel.table$Model[i])))[3]
-sel.table$Species <- species
-sel.table <- sel.table[,c(7,6,1,2,3,4,5)]
-final.sel.table <- rbind(final.sel.table, sel.table)
-
-# coerce model output into nice dataframe and save
-subset(mod.list, delta < 2) #delta AICc for small sample bias
-
-# --> if one top model (fill in best-fit model): 
-mod.out <- data.frame(summary(m1)[6]$coefficients$cond)
-mod.out$Coefficient <- row.names(mod.out)
-row.names(mod.out) <- c()
-mod.out[,c(1:2,4)] <- round(mod.out[,c(1:2,4)], 3)
-mod.out[,3] <- round(mod.out[,3],2)
-names(mod.out)[2:4] <- c("SE", "z value", "p value")
-mod.out$Species <- species
-mod.out <- mod.out[,c(6,5,1:4)]
-final.mod.table <- rbind(final.mod.table, mod.out)
-
-# --> if need to model average: (note: use conditional model average; SE in table is the adjusted SE)
-mod.out <- data.frame(summary(model.avg(mod.list, subset = delta < 2))[10])
-mod.out$coefmat.subset.Std..Error <- NULL
-mod.out$Coefficient <- row.names(mod.out)
-row.names(mod.out) <- c()
-re <- "\\(([^()]+)\\)"
-mod.out$Coefficient <- gsub(re, "\\1", str_extract_all(mod.out$Coefficient, re))
-mod.out[mod.out$Coefficient == "Int",]$Coefficient <- c("(Intercept)")
-names(mod.out)[1:4] <- c("Estimate", "SE", "z value", "p value")
-mod.out[,c(1,2,4)] <- round(mod.out[,c(1,2,4)],3)
-mod.out[,3] <- round(mod.out[,3],2)
-mod.out$Species <- species
-mod.out <- mod.out[,c(6,5,1:4)]
-final.mod.table <- rbind(final.mod.table, mod.out)
-
-# save results 
-final.mod.table$sig <- ifelse(final.mod.table$`p value` <= 0.05, "*", "")
-write.csv(final.mod.table, "Activity_Models.csv", row.names=F)
-write.csv(final.sel.table, "Activity_Models_AIC.csv", row.names=F)
-
-## --> predator covariates correlate with activity level of: 
-# - waterbuck (before/after x wild dog area)
-# - reedbuck (before/after)
-# - buffalo (before/after x wild dog area)
-# - bushbuck (before/after x wild dog area)
-
-## --> plotting results 
-# note: I ran these on a supercomputer with nboots=1000 and uploaded those data to make these graphs; for quick laptop visualization purposes, run nboots=10
-nboots <- 10
-
-# - recalculate activity levels
-dat$tag <- paste(dat$TimePeriod, dat$WildDogUse)
-
-# - 1) waterbuck (before/after x wild dog area)
-wb.act <- activity.level.plot(dat, species="Waterbuck", nboots=nboots, WildDogUse=T) 
-names(wb.act)[8] <- "Time Period"
-
-(p1 <- ggplot(wb.act, aes(x = x, y = y, group = tag)) + 
-  scale_x_continuous(name="Time (Hrs)", breaks = seq(from=0, to=24, by=4), limits=c(0,24), 
-                     expand = c(0,0)) +
-  geom_ribbon(aes(ymin=lcl, ymax=ucl), fill="blue", alpha=0.2) +
-  geom_line(aes(lty=`Time Period`)) + 
-  annotate("rect",xmin=0,xmax=6,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  annotate("rect",xmin=19,xmax=24,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
-  ggtitle("Waterbuck Diel Activity") + ylab("Density") +
-  facet_wrap(~wild.dog))
-
-# - 2) reedbuck (before/after)
-rb.act <- activity.level.plot(dat, species="Reedbuck", nboots=nboots, WildDogUse=F) 
-names(rb.act)[6] <- "Time Period"
-
-(p2 <- ggplot(rb.act, aes(x = x, y = y, group = `Time Period`)) + 
-  scale_x_continuous(name="Time (Hrs)", breaks = seq(from=0, to=24, by=4), limits=c(0,24), 
-                     expand = c(0,0)) +
-  geom_ribbon(aes(ymin=lcl, ymax=ucl), fill="blue", alpha=0.2) +
-  geom_line(aes(lty=`Time Period`)) + 
-  annotate("rect",xmin=0,xmax=6,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  annotate("rect",xmin=19,xmax=24,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
-  ggtitle("Reedbuck Diel Activity") + ylab("Density"))
-
-
-# - 3) buffalo (before/after x wild dog area)
-(bf.act <- activity.level.plot(dat, species="Buffalo", nboots=nboots, WildDogUse=T) 
-names(bf.act)[8] <- "Time Period"
-
-p3 <- ggplot(bf.act, aes(x = x, y = y, group = tag)) + 
-  scale_x_continuous(name="Time (Hrs)", breaks = seq(from=0, to=24, by=4), limits=c(0,24), 
-                     expand = c(0,0)) +
-  geom_ribbon(aes(ymin=lcl, ymax=ucl), fill="blue", alpha=0.2) +
-  geom_line(aes(lty=`Time Period`)) + 
-  annotate("rect",xmin=0,xmax=6,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  annotate("rect",xmin=19,xmax=24,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
-  ggtitle("Buffalo Diel Activity") + ylab("Density") +
-  facet_wrap(~wild.dog))
-
-
-# - 4) bushbuck (before/after x wild dog area)
-(bb.act <- activity.level.plot(dat, species="Bushbuck", nboots=10, WildDogUse=T) 
-names(bb.act)[8] <- "Time Period"
-
-p4 <- ggplot(bb.act, aes(x = x, y = y, group = tag)) + 
-  scale_x_continuous(name="Time (Hrs)", breaks = seq(from=0, to=24, by=4), limits=c(0,24), 
-                     expand = c(0,0)) +
-  geom_ribbon(aes(ymin=lcl, ymax=ucl), fill="blue", alpha=0.2) +
-  geom_line(aes(lty=`Time Period`)) + 
-  annotate("rect",xmin=0,xmax=6,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  annotate("rect",xmin=19,xmax=24,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") + 
-  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + 
-  ggtitle("Bushbuck Diel Activity") + ylab("Density") +
-  facet_wrap(~wild.dog))
-
-
-## 2) activity ----------------
-
-# does a) activity level and/or b) patterning of diel activity change after wild dog release i) across whole grid, ii) in areas of high/med/low use? 
-
-# calculates overlap index Dhat4 for the two fitted distributions, then generates a null distribution of overlap indices using data sampled randomly
-# with replacement from the combined data. This randomised distribution is then used to define an empirical probability distribution against which the 
-# probability that the observed overlap arose by chance is judged.
-# obs = observed overlap index; null = mean null overlap index; seNull = SE of null distribution; pNull = probability observed index arose by chance
-
-# loop through species (again, fewer boots for laptop visualization; real data run on supercomputer with nboots=1000)
-nboots <- 10 
-activity.levels <- data.frame(); activity.diffs <- data.frame(); diel.diffs <- data.frame()
+# loop through species
+nboots <- 1000 
+diel.diffs <- data.frame()
+seasons <- unique(dat$Season)
 
 for(i in 1:length(species.list)){
   
-  # no use, low use, high use 
-  act.list.all <- act.diel.difs(dat, species.list[i], "all", nboots)
-  act.list.no <- act.diel.difs(dat, species.list[i], "no.use", nboots)
-  act.list.low <- act.diel.difs(dat, species.list[i], "low.use", nboots)
-  act.list.high <- act.diel.difs(dat, species.list[i], "high.use", nboots)
-  
-  # activity levels before and after 
-  activity.levels <- rbind(activity.levels, act.list.all[[1]], act.list.no[[1]], act.list.low[[1]], act.list.high[[1]])
-  
-  # differences in activity levels before and after 
-  activity.diffs <- rbind(activity.diffs, act.list.all[[2]], act.list.no[[2]], act.list.low[[2]], act.list.high[[2]])
-  
-  # differences in diel patterning before and after 
-  diel.diffs <- rbind(diel.diffs, act.list.all[[3]], act.list.no[[3]], act.list.low[[3]], act.list.high[[3]])
+  for(j in 1:length(unique(seasons))){
+    sub <- dat[dat$Season == seasons[j],]
+    
+    # no use, low use, high use 
+    act.list.no <- act.diel.difs(sub, species.list[i], "no.use", nboots)
+    act.list.no$Season <- as.character(seasons[j])
+    act.list.low <- act.diel.difs(sub, species.list[i], "low.use", nboots)
+    act.list.low$Season <- as.character(seasons[j])
+    act.list.high <- act.diel.difs(sub, species.list[i], "high.use", nboots)
+    act.list.high$Season <- as.character(seasons[j])
+    
+    diel.diffs <- rbind(diel.diffs, act.list.no, act.list.low, act.list.high)
+  }
 }
 
-# save results 
-write.csv(activity.levels, "Activity_Levels.csv", row.names=F)
-write.csv(activity.diffs, "Activity_Difs.csv", row.names=F)
-write.csv(diel.diffs, "Diel_Difs.csv", row.names=F)
+
+## 2) evaluating whether shifts were specifically driven by wild dog activity (GAMs)
+
+dat.gam <- ddply(dat, .(Species, Season, Year, TimePeriod, WildDogUse, Sun.Hour), summarise, amt.activity=sum(tag)) 
+dat.gam.all <- ddply(dat.gam, .(Species,Season,Year,TimePeriod,WildDogUse), summarise, daily.act=sum(amt.activity))
+dat.gam <- merge(dat.gam, dat.gam.all, all.x=T)
+dat.gam$prop.act <- dat.gam$amt.activity/dat.gam$daily.act
+dat.gam$day.night <- ifelse(dat.gam$Sun.Hour >= 6 & dat.gam$Sun.Hour <= 18, "day", "night") #ct visibility 
+dat.gam$TimePeriod <- factor(dat.gam$TimePeriod, levels = c("PreRelease", "PostRelease")) #reoder levels 
+dat.gam$WildDogUse <- factor(dat.gam$WildDogUse, levels = c("no.use", "low.use", "high.use")) #reorder levels 
+dat.gam <- dat.gam %>% mutate(WD = interaction(WildDogUse, TimePeriod)) #specify interaction term 
+
+# look through species 
+gam.mods <- NULL 
+for(i in 1:length(species.list)){
+  
+  m3c <- gam(prop.act ~ s(Sun.Hour, by=WD, bs="cc") +
+               WildDogUse * TimePeriod + Season + day.night, 
+             family = quasibinomial, 
+             data = dat.3.3[dat.3.3$Species == species,])
+  
+  #look at residuals 
+  gam.check(m3c); acf(residuals(m3c))
+  
+  # coerce model output into nice data frame 
+  mod.out <- data.frame(summary(m3c)[6]$coefficients$cond)
+  mod.out$Coefficient <- row.names(mod.out)
+  row.names(mod.out) <- c()
+  mod.out[,c(1:2,4)] <- round(mod.out[,c(1:2,4)], 3)
+  mod.out[,3] <- round(mod.out[,3],2)
+  names(mod.out)[2:4] <- c("SE", "z value", "p value")
+  mod.out$Species <- as.character(species.list[i])
+  mod.out <- mod.out[,c(6,5,1:4)]
+  
+  gam.mods <- rbind(gam.mods, mod.out)
+}
 
 
-## 3) activity overlap ----------------
+## 3) evaluating whether diel activity  shifts minimized temporal overlap with wild dogs
 
-# is magnitude of overlap between before and after (i.e., lots overlap = not much change, little overlap = shift in activity) predicted by species traits? 
+mod.out <- NULL
+for(i in 1:length(species.list)){
+  m.morn <- glm(prop.act ~ WildDogUse * TimePeriod + Season, family = "quasibinomial", 
+                data = dat.3.3[dat.3.3$Sun.Hour %in% c(5:8) & dat.gam$Species == species,])
+  
+  m.even <- glm(prop.act ~ WildDogUse * TimePeriod + Season, family = "quasibinomial", 
+                data = dat.3.3[dat.3.3$Sun.Hour %in% c(16:19) & dat.gam$Species == species,])
+  
+  # save results 
+  mod.m <- data.frame(summary(m.morn)[12])
+  mod.m$Coefficient <- row.names(mod.m)
+  row.names(mod.m) <- c()
+  mod.m[,c(1:2,4)] <- round(mod.m[,c(1:2,4)], 3)
+  mod.m[,3] <- round(mod.m[,3],2)
+  names(mod.m)[1:4] <- c("Estimate", "SE", "t value", "p value")
+  mod.m$Species <- as.character(species.list[i])
+  mod.m$TimePeriod <- "Morning"
+  mod.m <- mod.m[,c(6,7,5,1:4)]
+  
+  mod.e <- data.frame(summary(m.even)[12])
+  mod.e$Coefficient <- row.names(mod.e)
+  row.names(mod.e) <- c()
+  mod.e[,c(1:2,4)] <- round(mod.e[,c(1:2,4)], 3)
+  mod.e[,3] <- round(mod.e[,3],2)
+  names(mod.e)[1:4] <- c("Estimate", "SE", "t value", "p value")
+  mod.e$Species <- as.character(species.list[i])
+  mod.e$TimePeriod <- "Evening"
+  mod.e <- mod.e[,c(6,7,5,1:4)]
+  
+  mod.out <- rbind(mod.out, mod.m, mod.e)
+}
+
+
+## Q: do species traits predict magnitude of diel shifts in activity pattern? 
 
 # load species traits 
-species.traits <- read.csv("Gorongosa_Species_Traits.csv")
+species.traits <- read.csv("../../Analyses and Scripts/PROJECT_GNP_WildDogs/Gorongosa_Species_Traits.csv")
 names(species.traits)[1] <- "Species"
+species.traits$Digestive.System <- ifelse(species.traits$Digestive.System == "Ruminant", "Ruminant", "Non-ruminant")
 species.traits$s.Avg.Body.Mass <- scale(species.traits$Avg.Body.Mass)
+species.traits$WD.Index <- as.numeric(gsub( " .*$", "", species.traits$WD.Preference.Index))
+species.traits$s.Group.Size <- scale(species.traits$Social.Group.Size)
+species.traits$s.Interbirth <- scale(species.traits$Interbirth.Interval..d.)
+species.traits$sLitter <- scale(species.traits$Litter.Size)
+species.traits <- species.traits[c("Species", "Order", "Family", "Digestive.System", "Feeding.Guild", "WD.Index",
+                                   "s.Avg.Body.Mass", "s.Group.Size", "s.Interbirth", "sLitter")]
 
-# calculate index of overlap between circular distributions (Dhat4 overlap index)
-overlap.dat <- data.frame()
-nboots <- 10 #more for real data 
+# calculate index of overlap between circular distributions and associated error 
+nboots <- 1000 
+full.df <- data.frame()
+seasons <- unique(dat$Season)
 
-for (i in 1:length(species.list)){
+for(i in 1:length(species.list)){
   
-  # all 
-  all <- rbind(
-    activity.overlap(dat, species.list[i], "Wet", "all", nboots), #wet season
-    activity.overlap(dat, species.list[i], "Early Dry", "all", nboots), #early dry season
-    activity.overlap(dat, species.list[i], "Late Dry", "all", nboots)) #late dry season 
+  max.sub.df <- NULL
   
-  # no use 
-  no.use <- rbind(
-    activity.overlap(dat, species.list[i], "Wet", "no.use", nboots), #wet season
-    activity.overlap(dat, species.list[i], "Early Dry", "no.use", nboots), #early dry season
-    activity.overlap(dat, species.list[i], "Late Dry", "no.use", nboots)) #late dry season 
+  for(j in 1:length(unique(seasons))){
+    
+    sub <- dat[dat$Season == seasons[j] & dat$Species == species.list[i],]
+    sub.before <- sub[sub$TimePeriod == "PreRelease",]
+    sub.after <- sub[sub$TimePeriod == "PostRelease",]
+    amt.data <- data.frame(table(sub$TimePeriod, sub$WildDogUse))
+    
+    # no use
+    if(amt.data[1,3] <= 10 | amt.data[2,3] <= 10){
+      mean.no <- "not enough data"; sd.no <- "not enough data"; se.no <- "not enough data"
+      
+    } else if(amt.data[1,3] <= 75 | amt.data[1,3] <= 75){
+      boots.no <- bootstrap(sub.before[sub.before$WildDogUse == "no.use",]$Time.Sun, 
+                            sub.after[sub.after$WildDogUse == "no.use",]$Time.Sun, 
+                            nboots, type="Dhat1") 
+      mean.no <- as.character(mean(boots.no)); sd.no <- as.character(sd(boots.no))
+      se.no <- as.character(sd(boots.no)/sqrt(length(boots.no)))
+      
+    } else {
+      boots.no <- bootstrap(sub.before[sub.before$WildDogUse == "no.use",]$Time.Sun, 
+                            sub.after[sub.after$WildDogUse == "no.use",]$Time.Sun, 
+                            nboots, type="Dhat4") 
+      mean.no <- as.character(mean(boots.no)); sd.no <- as.character(sd(boots.no))
+      se.no <- as.character(sd(boots.no)/sqrt(length(boots.no)))
+    }
+    
+    # low use 
+    if(amt.data[3,3] <= 10 | amt.data[4,3] <= 10){
+      mean.low <- "not enough data"; sd.low <- "not enough data"; se.low <- "not enough data"
+      
+    } else if(amt.data[3,3] <= 75 | amt.data[4,3] <= 75){
+      
+      boots.low <- bootstrap(sub.before[sub.before$WildDogUse == "low.use",]$Time.Sun, 
+                             sub.after[sub.after$WildDogUse == "low.use",]$Time.Sun, 
+                             nboots, type="Dhat1") 
+      mean.low <- as.character(mean(boots.low)); sd.low <- as.character(sd(boots.low))
+      se.low <- as.character(sd(boots.low)/sqrt(length(boots.low)))
+      
+    } else {
+      boots.low <- bootstrap(sub.before[sub.before$WildDogUse == "low.use",]$Time.Sun, 
+                             sub.after[sub.after$WildDogUse == "low.use",]$Time.Sun, 
+                             nboots, type="Dhat4") 
+      mean.low <- as.character(mean(boots.low)); sd.low <- as.character(sd(boots.low))
+      se.low <- as.character(sd(boots.low)/sqrt(length(boots.low)))
+    }
+    
+    # high use 
+    if(amt.data[5,3] <= 10 | amt.data[6,3] <= 10){
+      mean.high <- "not enough data"; sd.high <- "not enough data"; se.high <- "not enough data"
+      
+    } else if(amt.data[5,3] <= 75 | amt.data[6,3] <= 75){
+      boots.high <- bootstrap(sub.before[sub.before$WildDogUse == "high.use",]$Time.Sun, 
+                              sub.after[sub.after$WildDogUse == "high.use",]$Time.Sun, 
+                              nboots, type="Dhat1") 
+      mean.high <- as.character(mean(boots.high)); sd.high <- as.character(sd(boots.high))
+      se.high <- as.character(sd(boots.high)/sqrt(length(boots.high)))
+      
+    } else {
+      boots.high <- bootstrap(sub.before[sub.before$WildDogUse == "high.use",]$Time.Sun, 
+                              sub.after[sub.after$WildDogUse == "high.use",]$Time.Sun, 
+                              nboots, type="Dhat4") 
+      mean.high <- as.character(mean(boots.high)); sd.high <- as.character(sd(boots.high))
+      se.high <- as.character(sd(boots.high)/sqrt(length(boots.high)))
+    }
+    
+    sub.df <- data.frame(species = as.character(species.list[i]),
+                         season = as.character(seasons[j]), 
+                         wilddoguse = c("no.use", "low.use", "high.use"),
+                         overlap = c(mean.no, mean.low, mean.high), 
+                         sd = c(sd.no, sd.low, sd.high), 
+                         se = c(se.no, se.low, se.high))
+    
+    max.sub.df <- rbind(max.sub.df, sub.df)
+  }
   
-  # low use 
-  low.use <- rbind(
-    activity.overlap(dat, species.list[i], "Wet", "low.use", nboots), #wet season
-    activity.overlap(dat, species.list[i], "Early Dry", "low.use", nboots), #early dry season
-    activity.overlap(dat, species.list[i], "Late Dry", "low.use", nboots)) #late dry season 
-  
-  # high use 
-  high.use <- rbind(
-    activity.overlap(dat, species.list[i], "Wet", "high.use", nboots), #wet season
-    activity.overlap(dat, species.list[i], "Early Dry", "high.use", nboots), #early dry season
-    activity.overlap(dat, species.list[i], "Late Dry", "high.use", nboots)) #late dry season 
-  
-  overlap.dat <- rbind(overlap.dat, no.use, low.use, high.use)
+  full.df <- rbind(full.df, max.sub.df)
 }
-  
+
 # save files 
-write.csv(overlap.dat, "Overlap_Data.csv", row.names=F)
+write.csv(full.df, "bootstrap_overlap.csv", row.names=F)
+overlap.dat <- read.csv("bootstrap_overlap.csv")
+names(overlap.dat)[1] <- "Species"
 
 # merge with species traits 
 overlap.dat <- merge(overlap.dat, species.traits, all.x=T)
 
-# regress overlap with traits 
-overlap.dat <- overlap.dat[!overlap.dat$Overlap == "Error - too few sightings",]
-overlap.dat <- overlap.dat[!overlap.dat$WildDogUse == "All",] #figure out what to do with these data later... 
-overlap.dat$Overlap <- as.numeric(as.character(overlap.dat$Overlap))
+overlap.dat$wilddoguse <- factor(overlap.dat$wilddoguse, levels = c("no.use", "low.use", "high.use"))
 
-m1 <- glmmTMB(Overlap ~ WildDogUse + Season + Feeding.Guild + s.Avg.Body.Mass + I(s.Avg.Body.Mass^2),
-              data = overlap.dat)
+# regress overlap with traits 
+overlap.dat <- overlap.dat[!overlap.dat$overlap == "not enough data",]
+overlap.dat[4:6] <- sapply(overlap.dat[4:6], as.character)
+overlap.dat[4:6] <- sapply(overlap.dat[4:6], as.numeric)
+
+# add errors back to response variable 
+errors(overlap.dat$overlap) <- overlap.dat$se
+
+m1 <- glm(overlap ~ wilddoguse + season + Feeding.Guild + s.Avg.Body.Mass + 
+            I(s.Avg.Body.Mass^2) + WD.Index + s.Group.Size + s.Interbirth + sLitter, 
+          family = quasibinomial, 
+          data = overlap.dat)
 
 # save output
-mod.out <- data.frame(summary(m1)[6]$coefficients$cond)
+mod.out <- data.frame(summary(m1)[12])
 mod.out$Coefficient <- row.names(mod.out)
 row.names(mod.out) <- c()
 mod.out[,c(1:2,4)] <- round(mod.out[,c(1:2,4)], 3)
 mod.out[,3] <- round(mod.out[,3],2)
-names(mod.out)[2:4] <- c("SE", "z value", "p value")
+names(mod.out)[1:4] <- c("Estimate", "SE", "t value", "p value")
 mod.out <- mod.out[,c(5,1:4)]
-write.csv(mod.out, "Overlap_Results.csv", row.names=F)
-
-# make predict dataframes and plot: 
-... do this! ... 
+write.csv(mod.out, "../../Analyses and Scripts/PROJECT_GNP_WildDogs/Traits_Overlap.csv", row.names=F)
