@@ -1,4 +1,5 @@
 library(dplyr)
+library(tidyr)
 library(ggplot2)
 
 # Explore Matt Hutchinson data
@@ -10,6 +11,10 @@ group_size_ungulate <- group_size %>%
 
 # doesn't have information on dates of the surveys; assume same as vigilance?
 unique(group_size$Year)
+
+# sample size 
+sample_size <- count(group_size, Year, Species)
+sample_size_wide <- pivot_wider(sample_size, names_from = "Year", values_from = "n")
 
 # Notes from Matt's README
 # The transects are: FP1 & FP2 (Road 4; floodplain transects) and S1 & S2 (Road 3; savanna transects). 
